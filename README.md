@@ -23,8 +23,13 @@ Il2CppDumper with Zygisk, dump il2cpp data at runtime, can bypass protection, en
    - `dump.cs`
    - `script.json`
    - `stringliteral.json` (currently an empty array because the runtime API path does not export string literals)
+   - `global-metadata.dat` (when decrypted metadata can be found in memory)
+   - `metadata_dump_status.txt` (written when metadata is not found)
    - `il2cpp.h` (a minimal signature parser shim, not a full structure-layout header)
    - `ida_py3.py`
 
 ## IDA usage
 `dump.cs` is useful for reading types, fields, and method declarations. For fast function-name recovery in IDA, import `Il2CppDumper/script.json` with `ida_py3.py`. Full `DummyDll/` output and a structure-rich `il2cpp.h` still require offline parsing with `global-metadata.dat` and `libil2cpp.so` via desktop Il2CppDumper.
+
+## Metadata dump
+The module scans readable process memory for decrypted metadata that starts with `0xFAB11BAF` and passes layout validation, then writes it as `global-metadata.dat`. If the game decrypts metadata into a non-standard layout, erases it after loading, or requires intercepting a custom decryptor before il2cpp consumes the buffer, the module writes `metadata_dump_status.txt` instead.

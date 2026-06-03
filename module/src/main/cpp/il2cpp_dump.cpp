@@ -8,13 +8,17 @@
 #include <cstring>
 #include <cinttypes>
 #include <cerrno>
+#include <cstdio>
 #include <algorithm>
 #include <cctype>
 #include <string>
 #include <vector>
 #include <sstream>
 #include <fstream>
+#include <fcntl.h>
+#include <limits.h>
 #include <sys/stat.h>
+#include <sys/types.h>
 #include <unistd.h>
 #include "xdl.h"
 #include "log.h"
@@ -42,6 +46,30 @@ struct DumpCollector {
     std::vector<ScriptMethodOutput> scriptMethods;
     std::vector<uint64_t> addresses;
 };
+
+struct MemoryRange {
+    uintptr_t start;
+    uintptr_t end;
+    std::string perms;
+    std::string name;
+};
+
+struct MetadataSection {
+    uint32_t offset;
+    uint32_t size;
+};
+
+struct MetadataCandidate {
+    uintptr_t address;
+    size_t size;
+    int version;
+    std::string mapName;
+};
+
+constexpr uint32_t METADATA_MAGIC = 0xFAB11BAF;
+constexpr size_t MAX_METADATA_DUMP_SIZE = 512 * 1024 * 1024;
+constexpr size_t METADATA_HEADER_SCAN_SIZE = 512;
+constexpr size_t MEMORY_SCAN_CHUNK_SIZE = 64 * 1024;
 
 const char *safe_cstr(const char *value) {
     return value ? value : "";
@@ -348,6 +376,304 @@ void write_script_json(const std::string &path, DumpCollector &collector) {
 void write_text_file(const std::string &path, const std::string &content) {
     std::ofstream outStream(path);
     outStream << content;
+}
+
+uint32_t read_u32_le(const uint8_t *data, size_t offset) {
+    uint32_t value = 0;
+    memcpy(&value, data + offset, sizeof(value));
+    return value;
+}
+
+int32_t read_i32_le(const uint8_t *data, size_t offset) {
+    int32_t value = 0;
+    memcpy(&value, data + offset, sizeof(value));
+    return value;
+}
+
+bool read_process_memory(int memFd, uintptr_t address, void *buffer, size_t size) {
+    auto *cursor = static_cast<uint8_t *>(buffer);
+    size_t totalRead = 0;
+    while (totalRead < size) {
+        auto readSize = pread(memFd, cursor + totalRead, size - totalRead,
+                              static_cast<off_t>(address + totalRead));
+        if (readSize <= 0) {
+            return false;
+        }
+        totalRead += static_cast<size_t>(readSize);
+    }
+    return true;
+}
+
+bool add_metadata_section(std::vector<MetadataSection> &sections, uint32_t offset, int32_t size) {
+    if (size < 0) {
+        return false;
+    }
+    if (size == 0) {
+        return true;
+    }
+    if (offset == 0) {
+        return false;
+    }
+    sections.push_back({offset, static_cast<uint32_t>(size)});
+    return true;
+}
+
+bool parse_metadata_header(const uint8_t *header, size_t headerSize, size_t availableSize,
+                           MetadataCandidate *candidate) {
+    if (headerSize < 8 || read_u32_le(header, 0) != METADATA_MAGIC) {
+        return false;
+    }
+
+    auto version = read_i32_le(header, 4);
+    if (version < 16 || version > 31) {
+        return false;
+    }
+
+    size_t cursor = 8;
+    std::vector<MetadataSection> sections;
+
+    auto readSection = [&](bool present, MetadataSection *section) -> bool {
+        if (!present) {
+            *section = {0, 0};
+            return true;
+        }
+        if (cursor + 8 > headerSize) {
+            return false;
+        }
+        auto offset = read_u32_le(header, cursor);
+        auto size = read_i32_le(header, cursor + 4);
+        cursor += 8;
+        *section = {offset, size > 0 ? static_cast<uint32_t>(size) : 0};
+        return add_metadata_section(sections, offset, size);
+    };
+
+    MetadataSection stringLiterals{};
+    MetadataSection stringLiteralData{};
+    MetadataSection metadataStrings{};
+    MetadataSection events{};
+    MetadataSection properties{};
+    MetadataSection methods{};
+    MetadataSection parameterDefaultValues{};
+    MetadataSection fieldDefaultValues{};
+    MetadataSection defaultValueData{};
+    MetadataSection fieldMarshaledSizes{};
+    MetadataSection parameters{};
+    MetadataSection fields{};
+    MetadataSection genericParameters{};
+    MetadataSection genericParameterConstraints{};
+    MetadataSection genericContainers{};
+    MetadataSection nestedTypes{};
+    MetadataSection interfaces{};
+    MetadataSection vtableMethods{};
+    MetadataSection interfaceOffsets{};
+    MetadataSection typeDefinitions{};
+    MetadataSection rgctxEntries{};
+    MetadataSection images{};
+    MetadataSection assemblies{};
+    MetadataSection metadataUsageLists{};
+    MetadataSection metadataUsagePairs{};
+    MetadataSection fieldRefs{};
+    MetadataSection referencedAssemblies{};
+    MetadataSection attributesInfo{};
+    MetadataSection attributeTypes{};
+    MetadataSection attributeData{};
+    MetadataSection attributeDataRange{};
+    MetadataSection unresolvedVirtualCallParameterTypes{};
+    MetadataSection unresolvedVirtualCallParameterRanges{};
+    MetadataSection windowsRuntimeTypeNames{};
+    MetadataSection windowsRuntimeStrings{};
+    MetadataSection exportedTypeDefinitions{};
+
+    if (!readSection(true, &stringLiterals) ||
+        !readSection(true, &stringLiteralData) ||
+        !readSection(true, &metadataStrings) ||
+        !readSection(true, &events) ||
+        !readSection(true, &properties) ||
+        !readSection(true, &methods) ||
+        !readSection(true, &parameterDefaultValues) ||
+        !readSection(true, &fieldDefaultValues) ||
+        !readSection(true, &defaultValueData) ||
+        !readSection(true, &fieldMarshaledSizes) ||
+        !readSection(true, &parameters) ||
+        !readSection(true, &fields) ||
+        !readSection(true, &genericParameters) ||
+        !readSection(true, &genericParameterConstraints) ||
+        !readSection(true, &genericContainers) ||
+        !readSection(true, &nestedTypes) ||
+        !readSection(true, &interfaces) ||
+        !readSection(true, &vtableMethods) ||
+        !readSection(true, &interfaceOffsets) ||
+        !readSection(true, &typeDefinitions)) {
+        return false;
+    }
+
+    auto hasRGCTXData = version < 24 || (version == 24 && stringLiterals.offset != 264);
+    if (!readSection(hasRGCTXData, &rgctxEntries) ||
+        !readSection(true, &images) ||
+        !readSection(true, &assemblies) ||
+        !readSection(version >= 19 && version <= 24, &metadataUsageLists) ||
+        !readSection(version >= 19 && version <= 24, &metadataUsagePairs) ||
+        !readSection(version >= 19, &fieldRefs) ||
+        !readSection(version >= 20, &referencedAssemblies) ||
+        !readSection(version >= 21 && version <= 27, &attributesInfo) ||
+        !readSection(version >= 21 && version <= 27, &attributeTypes) ||
+        !readSection(version >= 29, &attributeData) ||
+        !readSection(version >= 29, &attributeDataRange) ||
+        !readSection(version >= 22, &unresolvedVirtualCallParameterTypes) ||
+        !readSection(version >= 22, &unresolvedVirtualCallParameterRanges) ||
+        !readSection(version >= 23, &windowsRuntimeTypeNames) ||
+        !readSection(version >= 27, &windowsRuntimeStrings) ||
+        !readSection(version >= 24, &exportedTypeDefinitions)) {
+        return false;
+    }
+
+    if (metadataStrings.size == 0 || typeDefinitions.size == 0 ||
+        images.size == 0 || assemblies.size == 0) {
+        return false;
+    }
+
+    uint64_t minSectionOffset = UINT64_MAX;
+    uint64_t metadataSize = 0;
+    for (const auto &section: sections) {
+        auto sectionStart = static_cast<uint64_t>(section.offset);
+        auto sectionEnd = sectionStart + section.size;
+        if (sectionEnd < sectionStart || sectionEnd > availableSize ||
+            sectionEnd > MAX_METADATA_DUMP_SIZE) {
+            return false;
+        }
+        minSectionOffset = std::min(minSectionOffset, sectionStart);
+        metadataSize = std::max(metadataSize, sectionEnd);
+    }
+
+    // 第一段数据通常紧跟 header。这个约束能过滤掉普通数据里偶然出现的 magic。
+    if (minSectionOffset == UINT64_MAX || minSectionOffset < cursor ||
+        minSectionOffset > 0x1000 || metadataSize < minSectionOffset) {
+        return false;
+    }
+
+    candidate->size = static_cast<size_t>(metadataSize);
+    candidate->version = version;
+    return candidate->size >= minSectionOffset && candidate->size <= MAX_METADATA_DUMP_SIZE;
+}
+
+std::vector<MemoryRange> get_readable_memory_ranges() {
+    std::vector<MemoryRange> ranges;
+    FILE *maps = fopen("/proc/self/maps", "r");
+    if (!maps) {
+        LOGE("open /proc/self/maps failed, errno: %d", errno);
+        return ranges;
+    }
+
+    char line[PATH_MAX + 256];
+    while (fgets(line, sizeof(line), maps)) {
+        uintptr_t start = 0;
+        uintptr_t end = 0;
+        char perms[5] = {};
+        char name[PATH_MAX] = {};
+        auto count = sscanf(line, "%" SCNxPTR "-%" SCNxPTR " %4s %*s %*s %*s %1023[^\n]",
+                            &start, &end, perms, name);
+        if (count < 3 || end <= start || perms[0] != 'r') {
+            continue;
+        }
+
+        std::string mapName = count >= 4 ? name : "";
+        if (mapName == "[vvar]" || mapName == "[vdso]" || mapName == "[vectors]") {
+            continue;
+        }
+        ranges.push_back({start, end, perms, mapName});
+    }
+    fclose(maps);
+    return ranges;
+}
+
+bool find_metadata_candidate(int memFd, MetadataCandidate *bestCandidate) {
+    auto ranges = get_readable_memory_ranges();
+    std::vector<uint8_t> chunk(MEMORY_SCAN_CHUNK_SIZE);
+    std::vector<uint8_t> header(METADATA_HEADER_SCAN_SIZE);
+    bool found = false;
+
+    for (const auto &range: ranges) {
+        auto position = range.start;
+        while (position < range.end) {
+            auto bytesLeft = static_cast<size_t>(range.end - position);
+            auto bytesToRead = std::min(bytesLeft, chunk.size());
+            if (!read_process_memory(memFd, position, chunk.data(), bytesToRead)) {
+                break;
+            }
+
+            for (size_t i = 0; i + sizeof(uint32_t) <= bytesToRead; ++i) {
+                if (read_u32_le(chunk.data(), i) != METADATA_MAGIC) {
+                    continue;
+                }
+
+                auto candidateAddress = position + i;
+                auto availableSize = static_cast<size_t>(range.end - candidateAddress);
+                auto headerBytes = std::min(header.size(), availableSize);
+                MetadataCandidate candidate{};
+                candidate.address = candidateAddress;
+                candidate.mapName = range.name;
+                if (read_process_memory(memFd, candidateAddress, header.data(), headerBytes) &&
+                    parse_metadata_header(header.data(), headerBytes, availableSize, &candidate)) {
+                    LOGI("metadata candidate: %p size: %zu version: %d map: %s",
+                         reinterpret_cast<void *>(candidate.address),
+                         candidate.size,
+                         candidate.version,
+                         candidate.mapName.c_str());
+                    if (!found || candidate.size > bestCandidate->size) {
+                        *bestCandidate = candidate;
+                        found = true;
+                    }
+                }
+            }
+
+            if (bytesToRead <= sizeof(uint32_t)) {
+                position += bytesToRead;
+            } else {
+                position += bytesToRead - (sizeof(uint32_t) - 1);
+            }
+        }
+    }
+    return found;
+}
+
+bool dump_global_metadata(const std::string &outPath) {
+    int memFd = open("/proc/self/mem", O_RDONLY | O_CLOEXEC);
+    if (memFd < 0) {
+        LOGE("open /proc/self/mem failed, errno: %d", errno);
+        return false;
+    }
+
+    MetadataCandidate candidate{};
+    if (!find_metadata_candidate(memFd, &candidate)) {
+        close(memFd);
+        LOGW("decrypted global-metadata.dat not found in readable memory");
+        return false;
+    }
+
+    std::ofstream outStream(outPath, std::ios::binary);
+    if (!outStream) {
+        close(memFd);
+        LOGE("open metadata output failed: %s", outPath.c_str());
+        return false;
+    }
+
+    std::vector<uint8_t> buffer(MEMORY_SCAN_CHUNK_SIZE);
+    size_t written = 0;
+    while (written < candidate.size) {
+        auto bytesToRead = std::min(buffer.size(), candidate.size - written);
+        if (!read_process_memory(memFd, candidate.address + written, buffer.data(), bytesToRead)) {
+            close(memFd);
+            LOGE("read metadata memory failed at offset: %zu", written);
+            return false;
+        }
+        outStream.write(reinterpret_cast<const char *>(buffer.data()), bytesToRead);
+        written += bytesToRead;
+    }
+
+    close(memFd);
+    LOGI("global-metadata.dat dumped: %s size: %zu version: %d",
+         outPath.c_str(), candidate.size, candidate.version);
+    return true;
 }
 
 void init_il2cpp_api(void *handle) {
@@ -762,6 +1088,12 @@ void il2cpp_dump(const char *outDir) {
     write_text_file(dumpDir + "/dump.cs", dumpCs.str());
     write_script_json(dumpDir + "/script.json", collector);
     write_text_file(dumpDir + "/stringliteral.json", "[]\n");
+    if (!dump_global_metadata(dumpDir + "/global-metadata.dat")) {
+        write_text_file(dumpDir + "/metadata_dump_status.txt",
+                        "global-metadata.dat was not found in readable process memory.\n"
+                        "The game may decrypt metadata into a non-standard layout, erase it after loading, "
+                        "or require hooking its loader/decryptor before il2cpp consumes the buffer.\n");
+    }
     write_text_file(dumpDir + "/il2cpp.h",
                     "/*\n"
                     " * Runtime Zygisk dump header.\n"

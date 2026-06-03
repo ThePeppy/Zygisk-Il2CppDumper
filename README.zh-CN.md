@@ -16,4 +16,13 @@ Zygisk版Il2CppDumper，在游戏运行时dump il2cpp数据，可以绕过保护
       2. 编辑`game.h`, 修改`GamePackageName`为游戏包名
       3. 使用Android Studio运行gradle任务`:module:assembleRelease`编译，zip包会生成在`out`文件夹下
 3. 在Magisk里安装模块
-4. 启动游戏，会在`/data/data/GamePackageName/files/`目录下生成`dump.cs`
+4. 启动游戏，会在`/data/data/GamePackageName/files/`目录下生成旧路径兼容用的`dump.cs`
+5. 同时会在`/data/data/GamePackageName/files/Il2CppDumper/`目录下生成更接近桌面版的运行时输出：
+   - `dump.cs`
+   - `script.json`
+   - `stringliteral.json`（运行时 API 暂不导出字符串字面量，所以当前为空数组）
+   - `il2cpp.h`（仅用于 IDA/Ghidra 解析基础函数签名，不包含完整结构体布局）
+   - `ida_py3.py`
+
+## 关于 IDA 恢复
+`dump.cs` 只适合阅读类型、字段和方法声明；如果要在 IDA 里快速恢复函数名，请优先使用`Il2CppDumper/script.json`配合`ida_py3.py`导入。完整的`DummyDll/`和带字段布局的`il2cpp.h`仍然依赖`global-metadata.dat`和`libil2cpp.so`的离线解析，建议用桌面版 Il2CppDumper 继续生成。

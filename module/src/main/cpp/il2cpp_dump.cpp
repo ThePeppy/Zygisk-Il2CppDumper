@@ -7,10 +7,14 @@
 #include <cstdlib>
 #include <cstring>
 #include <cinttypes>
+#include <cerrno>
+#include <algorithm>
+#include <cctype>
 #include <string>
 #include <vector>
 #include <sstream>
 #include <fstream>
+#include <sys/stat.h>
 #include <unistd.h>
 #include "xdl.h"
 #include "log.h"
@@ -24,6 +28,327 @@
 #undef DO_API
 
 static uint64_t il2cpp_base = 0;
+
+bool _il2cpp_type_is_byref(const Il2CppType *type);
+
+struct ScriptMethodOutput {
+    uint64_t address;
+    std::string name;
+    std::string signature;
+    std::string typeSignature;
+};
+
+struct DumpCollector {
+    std::vector<ScriptMethodOutput> scriptMethods;
+    std::vector<uint64_t> addresses;
+};
+
+const char *safe_cstr(const char *value) {
+    return value ? value : "";
+}
+
+bool ensure_dir(const std::string &path) {
+    if (path.empty()) {
+        return false;
+    }
+    if (mkdir(path.c_str(), 0770) == 0 || errno == EEXIST) {
+        return true;
+    }
+    LOGE("mkdir failed: %s, errno: %d", path.c_str(), errno);
+    return false;
+}
+
+std::string json_escape(const std::string &value) {
+    std::stringstream outPut;
+    for (unsigned char c: value) {
+        switch (c) {
+            case '\"':
+                outPut << "\\\"";
+                break;
+            case '\\':
+                outPut << "\\\\";
+                break;
+            case '\b':
+                outPut << "\\b";
+                break;
+            case '\f':
+                outPut << "\\f";
+                break;
+            case '\n':
+                outPut << "\\n";
+                break;
+            case '\r':
+                outPut << "\\r";
+                break;
+            case '\t':
+                outPut << "\\t";
+                break;
+            default:
+                if (c < 0x20) {
+                    char buffer[7];
+                    snprintf(buffer, sizeof(buffer), "\\u%04x", c);
+                    outPut << buffer;
+                } else {
+                    outPut << c;
+                }
+                break;
+        }
+    }
+    return outPut.str();
+}
+
+bool is_c_keyword(const std::string &value) {
+    static const char *keywords[] = {
+            "auto", "break", "case", "char", "const", "continue", "default", "do",
+            "double", "else", "enum", "extern", "float", "for", "goto", "if",
+            "inline", "int", "long", "register", "restrict", "return", "short",
+            "signed", "sizeof", "static", "struct", "switch", "typedef", "union",
+            "unsigned", "void", "volatile", "while", "_Bool"
+    };
+    for (auto keyword: keywords) {
+        if (value == keyword) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::string fix_c_name(const std::string &value) {
+    std::string fixedName;
+    fixedName.reserve(value.size() + 1);
+    for (unsigned char c: value) {
+        if (std::isalnum(c) || c == '_') {
+            fixedName.push_back(static_cast<char>(c));
+        } else {
+            fixedName.push_back('_');
+        }
+    }
+    if (fixedName.empty()) {
+        fixedName = "_";
+    }
+    if (std::isdigit(static_cast<unsigned char>(fixedName[0])) || is_c_keyword(fixedName)) {
+        fixedName.insert(fixedName.begin(), '_');
+    }
+    return fixedName;
+}
+
+std::string get_class_script_name(Il2CppClass *klass) {
+    std::vector<std::string> names;
+    auto current = klass;
+    while (current) {
+        names.emplace_back(safe_cstr(il2cpp_class_get_name(current)));
+        current = il2cpp_class_get_declaring_type ? il2cpp_class_get_declaring_type(current) : nullptr;
+    }
+    std::reverse(names.begin(), names.end());
+
+    std::stringstream outPut;
+    auto namespaze = safe_cstr(il2cpp_class_get_namespace(klass));
+    if (strlen(namespaze) > 0) {
+        outPut << namespaze << ".";
+    }
+    for (size_t i = 0; i < names.size(); ++i) {
+        if (i > 0) {
+            outPut << ".";
+        }
+        outPut << names[i];
+    }
+    return outPut.str();
+}
+
+std::string get_c_type_name(const Il2CppType *type) {
+    if (!type) {
+        return "void*";
+    }
+
+    std::string typeName;
+    switch (type->type) {
+        case IL2CPP_TYPE_VOID:
+            typeName = "void";
+            break;
+        case IL2CPP_TYPE_BOOLEAN:
+            typeName = "bool";
+            break;
+        case IL2CPP_TYPE_CHAR:
+            typeName = "unsigned short";
+            break;
+        case IL2CPP_TYPE_I1:
+            typeName = "signed char";
+            break;
+        case IL2CPP_TYPE_U1:
+            typeName = "unsigned char";
+            break;
+        case IL2CPP_TYPE_I2:
+            typeName = "short";
+            break;
+        case IL2CPP_TYPE_U2:
+            typeName = "unsigned short";
+            break;
+        case IL2CPP_TYPE_I4:
+            typeName = "int";
+            break;
+        case IL2CPP_TYPE_U4:
+            typeName = "unsigned int";
+            break;
+        case IL2CPP_TYPE_I8:
+            typeName = "long long";
+            break;
+        case IL2CPP_TYPE_U8:
+            typeName = "unsigned long long";
+            break;
+        case IL2CPP_TYPE_R4:
+            typeName = "float";
+            break;
+        case IL2CPP_TYPE_R8:
+            typeName = "double";
+            break;
+        case IL2CPP_TYPE_I:
+            typeName = "long";
+            break;
+        case IL2CPP_TYPE_U:
+            typeName = "unsigned long";
+            break;
+        case IL2CPP_TYPE_PTR:
+        case IL2CPP_TYPE_STRING:
+        case IL2CPP_TYPE_VALUETYPE:
+        case IL2CPP_TYPE_CLASS:
+        case IL2CPP_TYPE_VAR:
+        case IL2CPP_TYPE_ARRAY:
+        case IL2CPP_TYPE_GENERICINST:
+        case IL2CPP_TYPE_TYPEDBYREF:
+        case IL2CPP_TYPE_OBJECT:
+        case IL2CPP_TYPE_SZARRAY:
+        case IL2CPP_TYPE_MVAR:
+        default:
+            typeName = "void*";
+            break;
+    }
+
+    // 运行时 API 无法稳定还原完整结构体名，复杂类型统一写成指针，保证 IDA 能先应用函数原型。
+    if (_il2cpp_type_is_byref(type) && typeName != "void") {
+        typeName += "*";
+    }
+    return typeName;
+}
+
+char get_type_signature_char(const Il2CppType *type) {
+    if (!type || _il2cpp_type_is_byref(type)) {
+        return 'i';
+    }
+    switch (type->type) {
+        case IL2CPP_TYPE_VOID:
+            return 'v';
+        case IL2CPP_TYPE_I8:
+        case IL2CPP_TYPE_U8:
+            return 'j';
+        case IL2CPP_TYPE_R4:
+            return 'f';
+        case IL2CPP_TYPE_R8:
+            return 'd';
+        default:
+            return 'i';
+    }
+}
+
+void collect_script_method(Il2CppClass *klass, const MethodInfo *method, uint32_t flags,
+                           DumpCollector *collector) {
+    if (!collector || !method || !method->methodPointer || il2cpp_base == 0) {
+        return;
+    }
+
+    auto methodAddress = reinterpret_cast<uint64_t>(method->methodPointer);
+    if (methodAddress < il2cpp_base) {
+        return;
+    }
+
+    ScriptMethodOutput scriptMethod{};
+    scriptMethod.address = methodAddress - il2cpp_base;
+    scriptMethod.name = get_class_script_name(klass) + "$$" + safe_cstr(il2cpp_method_get_name(method));
+
+    std::vector<std::string> parameterStrs;
+    std::stringstream typeSignature;
+    auto returnType = il2cpp_method_get_return_type(method);
+    typeSignature << get_type_signature_char(returnType);
+
+    if ((flags & METHOD_ATTRIBUTE_STATIC) == 0) {
+        parameterStrs.emplace_back("void* __this");
+        typeSignature << 'i';
+    }
+
+    auto paramCount = il2cpp_method_get_param_count(method);
+    for (int i = 0; i < paramCount; ++i) {
+        auto param = il2cpp_method_get_param(method, i);
+        auto paramName = safe_cstr(il2cpp_method_get_param_name(method, i));
+        std::stringstream parameter;
+        parameter << get_c_type_name(param) << " ";
+        if (strlen(paramName) > 0) {
+            parameter << fix_c_name(paramName);
+        } else {
+            parameter << "param_" << i;
+        }
+        parameterStrs.emplace_back(parameter.str());
+        typeSignature << get_type_signature_char(param);
+    }
+
+    parameterStrs.emplace_back("const MethodInfo* method");
+    typeSignature << 'i';
+
+    std::stringstream signature;
+    signature << get_c_type_name(returnType) << " " << fix_c_name(scriptMethod.name) << " (";
+    for (size_t i = 0; i < parameterStrs.size(); ++i) {
+        if (i > 0) {
+            signature << ", ";
+        }
+        signature << parameterStrs[i];
+    }
+    signature << ");";
+    scriptMethod.signature = signature.str();
+    scriptMethod.typeSignature = typeSignature.str();
+
+    collector->scriptMethods.emplace_back(scriptMethod);
+    collector->addresses.emplace_back(scriptMethod.address);
+}
+
+void write_script_json(const std::string &path, DumpCollector &collector) {
+    std::sort(collector.addresses.begin(), collector.addresses.end());
+    collector.addresses.erase(std::unique(collector.addresses.begin(), collector.addresses.end()),
+                              collector.addresses.end());
+
+    std::ofstream outStream(path);
+    outStream << "{\n";
+    outStream << "  \"ScriptMethod\": [\n";
+    for (size_t i = 0; i < collector.scriptMethods.size(); ++i) {
+        const auto &method = collector.scriptMethods[i];
+        outStream << "    {\n";
+        outStream << "      \"Address\": " << std::dec << method.address << ",\n";
+        outStream << "      \"Name\": \"" << json_escape(method.name) << "\",\n";
+        outStream << "      \"Signature\": \"" << json_escape(method.signature) << "\",\n";
+        outStream << "      \"TypeSignature\": \"" << json_escape(method.typeSignature) << "\"\n";
+        outStream << "    }";
+        if (i + 1 < collector.scriptMethods.size()) {
+            outStream << ",";
+        }
+        outStream << "\n";
+    }
+    outStream << "  ],\n";
+    outStream << "  \"ScriptString\": [],\n";
+    outStream << "  \"ScriptMetadata\": [],\n";
+    outStream << "  \"ScriptMetadataMethod\": [],\n";
+    outStream << "  \"Addresses\": [\n";
+    for (size_t i = 0; i < collector.addresses.size(); ++i) {
+        outStream << "    " << std::dec << collector.addresses[i];
+        if (i + 1 < collector.addresses.size()) {
+            outStream << ",";
+        }
+        outStream << "\n";
+    }
+    outStream << "  ]\n";
+    outStream << "}\n";
+}
+
+void write_text_file(const std::string &path, const std::string &content) {
+    std::ofstream outStream(path);
+    outStream << content;
+}
 
 void init_il2cpp_api(void *handle) {
 #define DO_API(r, n, p) {                      \
@@ -92,7 +417,7 @@ bool _il2cpp_type_is_byref(const Il2CppType *type) {
     return byref;
 }
 
-std::string dump_method(Il2CppClass *klass) {
+std::string dump_method(Il2CppClass *klass, DumpCollector *collector) {
     std::stringstream outPut;
     outPut << "\n\t// Methods\n";
     void *iter = nullptr;
@@ -112,6 +437,7 @@ std::string dump_method(Il2CppClass *klass) {
         outPut << "\n\t";
         uint32_t iflags = 0;
         auto flags = il2cpp_method_get_flags(method, &iflags);
+        collect_script_method(klass, method, flags, collector);
         outPut << get_method_modifier(flags);
         //TODO genericContainerIndex
         auto return_type = il2cpp_method_get_return_type(method);
@@ -246,7 +572,7 @@ std::string dump_field(Il2CppClass *klass) {
     return outPut.str();
 }
 
-std::string dump_type(const Il2CppType *type) {
+std::string dump_type(const Il2CppType *type, DumpCollector *collector) {
     std::stringstream outPut;
     auto *klass = il2cpp_class_from_type(type);
     outPut << "\n// Namespace: " << il2cpp_class_get_namespace(klass) << "\n";
@@ -316,7 +642,7 @@ std::string dump_type(const Il2CppType *type) {
     outPut << "\n{";
     outPut << dump_field(klass);
     outPut << dump_property(klass);
-    outPut << dump_method(klass);
+    outPut << dump_method(klass, collector);
     //TODO EventInfo
     outPut << "}\n";
     return outPut.str();
@@ -354,6 +680,7 @@ void il2cpp_dump(const char *outDir) {
         imageOutput << "// Image " << i << ": " << il2cpp_image_get_name(image) << "\n";
     }
     std::vector<std::string> outPuts;
+    DumpCollector collector;
     if (il2cpp_image_get_class) {
         LOGI("Version greater than 2018.3");
         //使用il2cpp_image_get_class
@@ -366,7 +693,7 @@ void il2cpp_dump(const char *outDir) {
                 auto klass = il2cpp_image_get_class(image, j);
                 auto type = il2cpp_class_get_type(const_cast<Il2CppClass *>(klass));
                 //LOGD("type name : %s", il2cpp_type_get_name(type));
-                auto outPut = imageStr.str() + dump_type(type);
+                auto outPut = imageStr.str() + dump_type(type, &collector);
                 outPuts.push_back(outPut);
             }
         }
@@ -411,19 +738,79 @@ void il2cpp_dump(const char *outDir) {
                 auto klass = il2cpp_class_from_system_type((Il2CppReflectionType *) items[j]);
                 auto type = il2cpp_class_get_type(klass);
                 //LOGD("type name : %s", il2cpp_type_get_name(type));
-                auto outPut = imageStr.str() + dump_type(type);
+                auto outPut = imageStr.str() + dump_type(type, &collector);
                 outPuts.push_back(outPut);
             }
         }
     }
-    LOGI("write dump file");
-    auto outPath = std::string(outDir).append("/files/dump.cs");
-    std::ofstream outStream(outPath);
-    outStream << imageOutput.str();
+
+    auto filesDir = std::string(outDir).append("/files");
+    auto dumpDir = filesDir + "/Il2CppDumper";
+    ensure_dir(filesDir);
+    ensure_dir(dumpDir);
+
+    LOGI("write dump files");
+    std::stringstream dumpCs;
+    dumpCs << imageOutput.str();
     auto count = outPuts.size();
     for (int i = 0; i < count; ++i) {
-        outStream << outPuts[i];
+        dumpCs << outPuts[i];
     }
-    outStream.close();
-    LOGI("dump done!");
+
+    // 保留旧路径，兼容原 README 和已有拉取脚本；新目录放接近桌面版 Il2CppDumper 的输出结构。
+    write_text_file(filesDir + "/dump.cs", dumpCs.str());
+    write_text_file(dumpDir + "/dump.cs", dumpCs.str());
+    write_script_json(dumpDir + "/script.json", collector);
+    write_text_file(dumpDir + "/stringliteral.json", "[]\n");
+    write_text_file(dumpDir + "/il2cpp.h",
+                    "/*\n"
+                    " * Runtime Zygisk dump header.\n"
+                    " * This is a minimal parser shim for function signatures only.\n"
+                    " * Use desktop Il2CppDumper with libil2cpp.so and global-metadata.dat\n"
+                    " * when you need full class/field layouts.\n"
+                    " */\n"
+                    "typedef int bool;\n"
+                    "typedef void(*Il2CppMethodPointer)();\n"
+                    "struct MethodInfo { Il2CppMethodPointer methodPointer; };\n"
+                    "struct Il2CppClass;\n"
+                    "struct Il2CppObject { Il2CppClass *klass; void *monitor; };\n");
+    write_text_file(dumpDir + "/ida_py3.py",
+                    "# -*- coding: utf-8 -*-\n"
+                    "import json\n"
+                    "import os\n\n"
+                    "imageBase = idaapi.get_imagebase()\n\n"
+                    "def get_addr(addr):\n"
+                    "    return imageBase + addr\n\n"
+                    "def set_name(addr, name):\n"
+                    "    ret = idc.set_name(addr, name, SN_NOWARN | SN_NOCHECK)\n"
+                    "    if ret == 0:\n"
+                    "        idc.set_name(addr, name + '_' + str(addr), SN_NOWARN | SN_NOCHECK)\n\n"
+                    "def make_function(start, end):\n"
+                    "    next_func = idc.get_next_func(start)\n"
+                    "    if next_func < end:\n"
+                    "        end = next_func\n"
+                    "    if idc.get_func_attr(start, FUNCATTR_START) == start:\n"
+                    "        ida_funcs.del_func(start)\n"
+                    "    ida_funcs.add_func(start, end)\n\n"
+                    "path = idaapi.ask_file(False, '*.json', 'script.json from Zygisk-Il2CppDumper')\n"
+                    "header_path = os.path.join(os.path.dirname(path), 'il2cpp.h')\n"
+                    "has_header = os.path.exists(header_path)\n"
+                    "if has_header:\n"
+                    "    parse_decls(open(header_path, 'r').read(), 0)\n"
+                    "data = json.loads(open(path, 'rb').read().decode('utf-8'))\n\n"
+                    "addresses = data.get('Addresses', [])\n"
+                    "for index in range(len(addresses) - 1):\n"
+                    "    make_function(get_addr(addresses[index]), get_addr(addresses[index + 1]))\n\n"
+                    "for scriptMethod in data.get('ScriptMethod', []):\n"
+                    "    addr = get_addr(scriptMethod['Address'])\n"
+                    "    set_name(addr, scriptMethod['Name'])\n"
+                    "    signature = scriptMethod.get('Signature')\n"
+                    "    if has_header and signature:\n"
+                    "        try:\n"
+                    "            apply_type(addr, parse_decl(signature, 0), 1)\n"
+                    "        except Exception as e:\n"
+                    "            print('apply_type failed:', hex(addr), signature, e)\n\n"
+                    "print('Script finished!')\n");
+
+    LOGI("dump done! methods: %zu, output: %s", collector.scriptMethods.size(), dumpDir.c_str());
 }
